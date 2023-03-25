@@ -1,3 +1,10 @@
+# Secrets
+*.env
+client_secrets.txt
 access_token.txt
 
+# Default post file
+status.md
+
+# Executable
 /client
