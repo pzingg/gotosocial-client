@@ -1,4 +1,4 @@
-package client
+package wsclient
 
 // From github.com/webdeveloppro/golang-websocket-client
 
@@ -38,20 +38,21 @@ type WebSocketClient struct {
 }
 
 // NewWebSocketClient create new websocket connection
-func NewWebSocketClient(ctx context.Context, wsUrl string, msgChan chan GtsMessage) (*WebSocketClient, error) {
+func NewWebSocketClient(ctx context.Context, wsUrl string, msgChan chan GtsMessage) *WebSocketClient {
 	conn := WebSocketClient{
-		Messages: msgChan,
-		sendBuf:  make(chan []byte, 1),
+		configStr: wsUrl,
+		sendBuf:   make(chan []byte, 1),
+		Messages:  msgChan,
 	}
 	conn.Ctx, conn.CtxCancel = context.WithCancel(ctx)
-	conn.configStr = wsUrl
+	defer conn.CtxCancel()
 
 	fmt.Printf("Connecting to %s\n", wsUrl)
 
 	go conn.Listen()
 	go conn.listenWrite()
 	go conn.ping()
-	return &conn, nil
+	return &conn
 }
 
 func (conn *WebSocketClient) Connect() *websocket.Conn {

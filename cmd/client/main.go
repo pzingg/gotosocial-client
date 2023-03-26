@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -23,7 +22,9 @@ import (
 
 	"github.com/adrg/frontmatter"
 	"github.com/joho/godotenv"
-	"github.com/pzingg/gotosocial-client/pkg/client"
+	"github.com/pzingg/gotosocial-client/pkg/common"
+	"github.com/pzingg/gotosocial-client/pkg/oauthserver"
+	"github.com/pzingg/gotosocial-client/pkg/wsclient"
 	"github.com/spf13/cobra"
 )
 
@@ -39,42 +40,12 @@ type OAuth struct {
 	AccessToken  string
 }
 
-// URL path on our server
-const redirectPath = "/oauth/callback"
-
-// URL paths on GoToSocial server
-const authorizePath = "/oauth/authorize"
-const tokenPath = "/oauth/token"
-const appsPath = "/api/v1/apps"
-const statusPath = "/api/v1/statuses"
-const streamingPath = "/api/v1/streaming"
-
-// Where to write client secrets and access_token
-const secretsFile = "client_secrets.txt"
-const tokenFile = "access_token.txt"
-
-type ServerData struct {
-	Msg     string
-	Error   string
-	Payload string
-}
-
-type OAuthServer struct {
-	port      int
-	Responses chan ServerData
-}
-
 type AppResp struct {
 	ClientId     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 	Id           string `json:"id"`
 	Name         string `json:"name"`
 	RedirectURI  string `json:"redirect_uri"`
-}
-
-type AuthorizeResp struct {
-	State string `json:"state"`
-	Code  string `json:"code"`
 }
 
 type TokenResp struct {
@@ -92,6 +63,17 @@ type PostFrontMatter struct {
 // Version is the version being used.
 // It's injected into the binary by the build script.
 var Version string
+
+// URL paths on GoToSocial server
+const authorizePath = "/oauth/authorize"
+const tokenPath = "/oauth/token"
+const appsPath = "/api/v1/apps"
+const statusPath = "/api/v1/statuses"
+const streamingPath = "/api/v1/streaming"
+
+// Where to write client secrets and access_token
+const secretsFile = "client_secrets.txt"
+const tokenFile = "access_token.txt"
 
 // Close connection correctly on exit
 var sigs = make(chan os.Signal, 1)
@@ -221,7 +203,7 @@ func registerApp(ctx context.Context, args []string) error {
 	}
 	website, _ := os.LookupEnv("WEBSITE")
 
-	redirectUri := fmt.Sprintf("http://localhost:%d%s", port, redirectPath)
+	redirectUri := fmt.Sprintf("http://localhost:%d%s", port, oauthserver.RedirectPath)
 
 	m := url.Values{}
 	m.Set("client_name", "gtsclient")
@@ -275,115 +257,71 @@ func login(ctx context.Context, args []string) error {
 		return err
 	}
 
-	server := NewOAuthServer(port)
-	go server.Start()
-
-	// Wait for server to be up and running
-	select {
-	case ret := <-server.Responses:
-		fmt.Printf("Got startup response: %v\n", ret)
-	case <-time.After(1 * time.Second):
-		fmt.Println("Assuming server has started")
-	}
-
-	origin := fmt.Sprintf("http://localhost:%d", port)
-
-	var oauth = OAuth{
-		Origin:       origin,
+	oas := oauthserver.NewOAuthServer(ctx, port)
+	oauth := &OAuth{
+		Origin:       oas.Origin,
 		Instance:     instance,
 		ClientId:     clientId,
 		ClientSecret: clientSecret,
 		Scope:        scope,
-		RedirectUri:  origin + redirectPath,
+		RedirectUri:  oas.RedirectUri(),
 	}
 
-	authorize(&oauth)
+	authorize(oauth)
 
-	select {
-	case d := <-server.Responses:
-		fmt.Printf("Got auth response: %v\n", d)
-		if d.Msg == "oauth-code" {
-			if d.Payload != "" {
-				var authResp AuthorizeResp
-				err := json.Unmarshal([]byte(d.Payload), &authResp)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
+		select {
+		case <-sigs:
+			oas.Shutdown()
+			return nil
+		case <-oas.Ctx.Done():
+			return nil
+		case d := <-oas.Responses:
+			fmt.Printf("Got auth response: %v\n", d)
+			if d.Msg == "oauth-code" {
+				if d.Payload != "" {
+					var authResp oauthserver.AuthorizeResp
+					err := json.Unmarshal([]byte(d.Payload), &authResp)
 
-				if err != nil {
-					return err
+					if err != nil {
+						return err
+					}
+
+					if authResp.State != oauth.State {
+						return errors.New("State mismatch")
+					}
+
+					oauth.Code = authResp.Code
+
+					fmt.Println("Fetching token")
+					tokenData, err := getTokenResponse(oauth)
+					fmt.Printf("Got token response: %v\n", d)
+
+					if err != nil {
+						return err
+					}
+
+					var tokenResp TokenResp
+					err = json.Unmarshal([]byte(tokenData.Payload), &tokenResp)
+
+					if err != nil {
+						return err
+					}
+
+					oauth.AccessToken = tokenResp.AccessToken
+
+					fmt.Println("Writing access token")
+					line := oauth.AccessToken + "\n"
+					_ = os.WriteFile(tokenFile, []byte(line), 0644)
 				}
-
-				if authResp.State != oauth.State {
-					return errors.New("State mismatch")
-				}
-
-				oauth.Code = authResp.Code
-
-				fmt.Println("Fetching token")
-				tokenData, err := getTokenResponse(&oauth)
-				fmt.Printf("Got token response: %v\n", d)
-
-				if err != nil {
-					return err
-				}
-
-				var tokenResp TokenResp
-				err = json.Unmarshal([]byte(tokenData.Payload), &tokenResp)
-
-				if err != nil {
-					return err
-				}
-
-				oauth.AccessToken = tokenResp.AccessToken
-
-				fmt.Println("Writing access token")
-				line := oauth.AccessToken + "\n"
-				_ = os.WriteFile(tokenFile, []byte(line), 0644)
 			}
+		default:
+
 		}
-	case <-time.After(120 * time.Second):
-		fmt.Println("No response after 10 seconds")
 	}
 	return err
-}
-
-func NewOAuthServer(port int) *OAuthServer {
-	return &OAuthServer{port: port, Responses: make(chan ServerData)}
-}
-
-func (server *OAuthServer) Start() {
-	http.HandleFunc("/", server.rootGETHandler)
-	http.HandleFunc(redirectPath, server.callbackGETHandler)
-
-	addr := fmt.Sprintf(":%d", server.port)
-	var err = http.ListenAndServe(addr, nil)
-	if err != nil {
-		server.Responses <- ServerData{Msg: "started", Error: err.Error()}
-	} else {
-		m := make(map[string]string)
-		m["status"] = "ok"
-		b, _ := json.Marshal(m)
-
-		server.Responses <- ServerData{Msg: "started", Payload: string(b)}
-	}
-}
-
-func (server *OAuthServer) rootGETHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Got / request")
-	io.WriteString(w, "This is my website!\n")
-}
-
-func (server *OAuthServer) callbackGETHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Got callback request")
-
-	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state")
-
-	text := fmt.Sprintf("Authorization code is %s\n\nYou can close this window.", code)
-	io.WriteString(w, text)
-
-	resp := AuthorizeResp{Code: code, State: state}
-	b, _ := json.Marshal(resp)
-
-	server.Responses <- ServerData{Msg: "oauth-code", Payload: string(b)}
 }
 
 func authorize(oauth *OAuth) (err error) {
@@ -409,7 +347,7 @@ func authorize(oauth *OAuth) (err error) {
 	return err
 }
 
-func getTokenResponse(oauth *OAuth) (data *ServerData, err error) {
+func getTokenResponse(oauth *OAuth) (data *common.JsonResponse, err error) {
 	m := url.Values{}
 	m.Set("grant_type", "authorization_code")
 	m.Set("state", oauth.State)
@@ -423,7 +361,7 @@ func getTokenResponse(oauth *OAuth) (data *ServerData, err error) {
 	return httpPost("oauth-token", tokenUrl, m, "")
 }
 
-func postStatus(ctx context.Context, filename string) (data *ServerData, err error) {
+func postStatus(ctx context.Context, filename string) (data *common.JsonResponse, err error) {
 	if filename == "" {
 		return nil, errors.New("No filename")
 	}
@@ -486,11 +424,8 @@ func stream(ctx context.Context, streamType string) error {
 	q.Set("stream", streamType)
 	u.RawQuery = q.Encode()
 
-	messages := make(chan client.GtsMessage, 1)
-	wsClient, err := client.NewWebSocketClient(ctx, u.String(), messages)
-	if err != nil {
-		return err
-	}
+	messages := make(chan wsclient.GtsMessage, 1)
+	wsClient := wsclient.NewWebSocketClient(ctx, u.String(), messages)
 
 	m := make(map[string]string)
 	m["type"] = "subscribe"
@@ -503,7 +438,7 @@ func stream(ctx context.Context, streamType string) error {
 	}
 
 	fmt.Println("Waiting for messages on stream")
-	var message client.GtsMessage
+	var message wsclient.GtsMessage
 	for {
 		select {
 		case message = <-messages:
@@ -569,7 +504,7 @@ func getToken(filename string) (string, error) {
 	return token, nil
 }
 
-func httpGet(label string, url string) (data *ServerData, err error) {
+func httpGet(label string, url string) (data *common.JsonResponse, err error) {
 	r, err := http.NewRequest("GET", url, strings.NewReader(""))
 	if err != nil {
 		return nil, err
@@ -577,7 +512,7 @@ func httpGet(label string, url string) (data *ServerData, err error) {
 	return httpRequest(label, r)
 }
 
-func httpPost(label string, url string, m url.Values, auth string) (data *ServerData, err error) {
+func httpPost(label string, url string, m url.Values, auth string) (data *common.JsonResponse, err error) {
 	r, err := http.NewRequest("POST", url, strings.NewReader(m.Encode()))
 	if err != nil {
 		return nil, err
@@ -590,25 +525,26 @@ func httpPost(label string, url string, m url.Values, auth string) (data *Server
 	return httpRequest(label, r)
 }
 
-func httpRequest(label string, r *http.Request) (data *ServerData, err error) {
+func httpRequest(label string, r *http.Request) (data *common.JsonResponse, err error) {
 	client := &http.Client{}
 	resp, err := client.Do(r)
 	if err != nil {
 		return nil, err
 	}
 
+	d := &common.JsonResponse{Type: label}
 	if resp.StatusCode >= 300 {
-		log.Fatalf("Status is %d", resp.StatusCode)
+		d.Error = fmt.Sprintf("Status %d", resp.StatusCode)
 	}
 
 	defer resp.Body.Close()
-
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	return &ServerData{Msg: label, Payload: string(b)}, nil
+	d.Payload = string(b)
+	return d, nil
 }
 
 func prettyPrint(payload string, indent int) error {
