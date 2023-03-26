@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -13,13 +14,16 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/adrg/frontmatter"
 	"github.com/joho/godotenv"
+	"github.com/pzingg/gotosocial-client/pkg/client"
 	"github.com/spf13/cobra"
 )
 
@@ -43,17 +47,21 @@ const authorizePath = "/oauth/authorize"
 const tokenPath = "/oauth/token"
 const appsPath = "/api/v1/apps"
 const statusPath = "/api/v1/statuses"
+const streamingPath = "/api/v1/streaming"
 
 // Where to write client secrets and access_token
 const secretsFile = "client_secrets.txt"
 const tokenFile = "access_token.txt"
 
-var server = make(chan ServerData)
-
 type ServerData struct {
-	Msg      string
-	Error    string
-	JsonData string
+	Msg     string
+	Error   string
+	Payload string
+}
+
+type OAuthServer struct {
+	port      int
+	Responses chan ServerData
 }
 
 type AppResp struct {
@@ -84,6 +92,9 @@ type PostFrontMatter struct {
 // Version is the version being used.
 // It's injected into the binary by the build script.
 var Version string
+
+// Close connection correctly on exit
+var sigs = make(chan os.Signal, 1)
 
 func main() {
 	version := version()
@@ -131,6 +142,21 @@ func main() {
 	}
 	postCommand.Flags().StringVarP(&statusFile, "file", "f", "status.md", "Markdown file to post")
 	rootCmd.AddCommand(postCommand)
+
+	var streamType string
+	streamCommand := &cobra.Command{
+		Use:   "stream",
+		Short: "Listen for streaming from a gotosocial server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return stream(cmd.Context(), streamType)
+		},
+	}
+	streamCommand.Flags().StringVarP(&streamType, "type", "t", "public", "Stream type: user, public, direct, list, hashtag")
+	rootCmd.AddCommand(streamCommand)
+
+	// `signal.Notify` registers the given channel to
+	// receive notifications of the specified signals.
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
 	// run
 	if err := rootCmd.Execute(); err != nil {
@@ -206,13 +232,13 @@ func registerApp(ctx context.Context, args []string) error {
 	}
 
 	appsUrl := instance + appsPath
-	d, err := doPost("app", appsUrl, m, "")
+	d, err := httpPost("app", appsUrl, m, "")
 	if err != nil {
 		return err
 	}
 
 	var appResp AppResp
-	err = json.Unmarshal([]byte(d.JsonData), &appResp)
+	err = json.Unmarshal([]byte(d.Payload), &appResp)
 
 	fmt.Println("Writing client secrets")
 	content := fmt.Sprintf("CLIENT_ID=\"%s\"\nCLIENT_SECRET=\"%s\"\nREDIRECT_URI=\"%s\"\nAPP_ID=\"%s\"\nAPP_NAME=\"%s\"\n",
@@ -249,11 +275,12 @@ func login(ctx context.Context, args []string) error {
 		return err
 	}
 
-	go startOAuthServer(port)
+	server := NewOAuthServer(port)
+	go server.Start()
 
 	// Wait for server to be up and running
 	select {
-	case ret := <-server:
+	case ret := <-server.Responses:
 		fmt.Printf("Got startup response: %v\n", ret)
 	case <-time.After(1 * time.Second):
 		fmt.Println("Assuming server has started")
@@ -273,12 +300,12 @@ func login(ctx context.Context, args []string) error {
 	authorize(&oauth)
 
 	select {
-	case d := <-server:
+	case d := <-server.Responses:
 		fmt.Printf("Got auth response: %v\n", d)
 		if d.Msg == "oauth-code" {
-			if d.JsonData != "" {
+			if d.Payload != "" {
 				var authResp AuthorizeResp
-				err := json.Unmarshal([]byte(d.JsonData), &authResp)
+				err := json.Unmarshal([]byte(d.Payload), &authResp)
 
 				if err != nil {
 					return err
@@ -291,7 +318,7 @@ func login(ctx context.Context, args []string) error {
 				oauth.Code = authResp.Code
 
 				fmt.Println("Fetching token")
-				d, err = getToken(&oauth)
+				tokenData, err := getTokenResponse(&oauth)
 				fmt.Printf("Got token response: %v\n", d)
 
 				if err != nil {
@@ -299,7 +326,7 @@ func login(ctx context.Context, args []string) error {
 				}
 
 				var tokenResp TokenResp
-				err = json.Unmarshal([]byte(d.JsonData), &tokenResp)
+				err = json.Unmarshal([]byte(tokenData.Payload), &tokenResp)
 
 				if err != nil {
 					return err
@@ -308,7 +335,7 @@ func login(ctx context.Context, args []string) error {
 				oauth.AccessToken = tokenResp.AccessToken
 
 				fmt.Println("Writing access token")
-				line := fmt.Sprintf("Bearer %s\n", oauth.AccessToken)
+				line := oauth.AccessToken + "\n"
 				_ = os.WriteFile(tokenFile, []byte(line), 0644)
 			}
 		}
@@ -318,29 +345,33 @@ func login(ctx context.Context, args []string) error {
 	return err
 }
 
-func startOAuthServer(port int) {
-	http.HandleFunc("/", rootGETHandler)
-	http.HandleFunc(redirectPath, callbackGETHandler)
+func NewOAuthServer(port int) *OAuthServer {
+	return &OAuthServer{port: port, Responses: make(chan ServerData)}
+}
 
-	addr := fmt.Sprintf(":%d", port)
+func (server *OAuthServer) Start() {
+	http.HandleFunc("/", server.rootGETHandler)
+	http.HandleFunc(redirectPath, server.callbackGETHandler)
+
+	addr := fmt.Sprintf(":%d", server.port)
 	var err = http.ListenAndServe(addr, nil)
 	if err != nil {
-		server <- ServerData{Msg: "started", Error: err.Error()}
+		server.Responses <- ServerData{Msg: "started", Error: err.Error()}
 	} else {
 		m := make(map[string]string)
 		m["status"] = "ok"
 		b, _ := json.Marshal(m)
 
-		server <- ServerData{Msg: "started", JsonData: string(b)}
+		server.Responses <- ServerData{Msg: "started", Payload: string(b)}
 	}
 }
 
-func rootGETHandler(w http.ResponseWriter, r *http.Request) {
+func (server *OAuthServer) rootGETHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Got / request")
 	io.WriteString(w, "This is my website!\n")
 }
 
-func callbackGETHandler(w http.ResponseWriter, r *http.Request) {
+func (server *OAuthServer) callbackGETHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Got callback request")
 
 	code := r.URL.Query().Get("code")
@@ -352,7 +383,7 @@ func callbackGETHandler(w http.ResponseWriter, r *http.Request) {
 	resp := AuthorizeResp{Code: code, State: state}
 	b, _ := json.Marshal(resp)
 
-	server <- ServerData{Msg: "oauth-code", JsonData: string(b)}
+	server.Responses <- ServerData{Msg: "oauth-code", Payload: string(b)}
 }
 
 func authorize(oauth *OAuth) (err error) {
@@ -366,20 +397,19 @@ func authorize(oauth *OAuth) (err error) {
 		return err
 	}
 
-	q := u.Query()
-	q.Add("response_type", "code")
-	q.Add("state", oauth.State)
-	q.Add("client_id", oauth.ClientId)
-	q.Add("scope", oauth.Scope)
-	q.Add("redirect_uri", oauth.RedirectUri)
-
-	// assign encoded query string to http request
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("state", oauth.State)
+	q.Set("client_id", oauth.ClientId)
+	q.Set("scope", oauth.Scope)
+	q.Set("redirect_uri", oauth.RedirectUri)
 	u.RawQuery = q.Encode()
+
 	err = exec.Command("xdg-open", u.String()).Run()
 	return err
 }
 
-func getToken(oauth *OAuth) (data ServerData, err error) {
+func getTokenResponse(oauth *OAuth) (data *ServerData, err error) {
 	m := url.Values{}
 	m.Set("grant_type", "authorization_code")
 	m.Set("state", oauth.State)
@@ -390,31 +420,30 @@ func getToken(oauth *OAuth) (data ServerData, err error) {
 	m.Set("redirect_uri", oauth.RedirectUri)
 
 	tokenUrl := oauth.Instance + tokenPath
-	return doPost("oauth-token", tokenUrl, m, "")
+	return httpPost("oauth-token", tokenUrl, m, "")
 }
 
-func postStatus(ctx context.Context, filename string) (data ServerData, err error) {
+func postStatus(ctx context.Context, filename string) (data *ServerData, err error) {
 	if filename == "" {
-		return ServerData{}, errors.New("No filename")
+		return nil, errors.New("No filename")
 	}
 	instance, err := getInstance()
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
-	authBytes, err := os.ReadFile(tokenFile)
+	token, err := getToken(tokenFile)
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
-	auth := strings.ReplaceAll(string(authBytes), "\n", "")
 	file, err := os.Open(filename)
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
 
 	var matter PostFrontMatter
 	rest, err := frontmatter.Parse(file, &matter)
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
 
 	m := url.Values{}
@@ -423,14 +452,75 @@ func postStatus(ctx context.Context, filename string) (data ServerData, err erro
 	m.Set("visibility", matter.Visiblity)
 
 	statusUrl := instance + statusPath
-	d, err := doPost("status", statusUrl, m, auth)
+	auth := "Bearer " + token
+	d, err := httpPost("status", statusUrl, m, auth)
 	if err != nil {
 		return d, err
 	}
 
 	fmt.Println("Post succeeded")
-	fmt.Println(d.JsonData)
+	prettyPrint(d.Payload, 2)
 	return d, nil
+}
+
+func stream(ctx context.Context, streamType string) error {
+	instance, err := getInstance()
+	if err != nil {
+		return err
+	}
+	token, err := getToken(tokenFile)
+	if err != nil {
+		return err
+	}
+
+	streamingUrl := instance + streamingPath
+	u, err := url.Parse(streamingUrl)
+	if err != nil {
+		return err
+	}
+
+	/* u.Scheme = "wss" */
+	u.Scheme = "ws"
+	q := url.Values{}
+	q.Set("access_token", token)
+	q.Set("stream", streamType)
+	u.RawQuery = q.Encode()
+
+	messages := make(chan client.GtsMessage, 1)
+	wsClient, err := client.NewWebSocketClient(ctx, u.String(), messages)
+	if err != nil {
+		return err
+	}
+
+	m := make(map[string]string)
+	m["type"] = "subscribe"
+	m["stream"] = streamType
+	err = wsClient.Write(m)
+	if err != nil {
+		fmt.Println("Write failed, stopping")
+		wsClient.Stop()
+		return err
+	}
+
+	fmt.Println("Waiting for messages on stream")
+	var message client.GtsMessage
+	for {
+		select {
+		case message = <-messages:
+			fmt.Printf("Received message for %v: %s\n", message.Stream, message.Event)
+			prettyPrint(message.Payload, 2)
+		case <-sigs:
+			fmt.Println("Received signal. Stopping")
+			wsClient.Stop()
+			return nil
+		case <-wsClient.Ctx.Done():
+			fmt.Println("Received socket done. Goodbye")
+			return nil
+		default:
+
+		}
+		// spin spin spin
+	}
 }
 
 func getInstance() (instance string, err error) {
@@ -470,24 +560,44 @@ func getSecrets() (clientId string, clientSecret string, err error) {
 	return clientId, clientSecret, nil
 }
 
-func doPost(label string, url string, m url.Values, auth string) (data ServerData, err error) {
+func getToken(filename string) (string, error) {
+	b, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	token := strings.ReplaceAll(string(b), "\n", "")
+	return token, nil
+}
+
+func httpGet(label string, url string) (data *ServerData, err error) {
+	r, err := http.NewRequest("GET", url, strings.NewReader(""))
+	if err != nil {
+		return nil, err
+	}
+	return httpRequest(label, r)
+}
+
+func httpPost(label string, url string, m url.Values, auth string) (data *ServerData, err error) {
 	r, err := http.NewRequest("POST", url, strings.NewReader(m.Encode()))
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
 
 	r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	if auth != "" {
 		r.Header.Add("Authorization", auth)
 	}
+	return httpRequest(label, r)
+}
 
+func httpRequest(label string, r *http.Request) (data *ServerData, err error) {
 	client := &http.Client{}
 	resp, err := client.Do(r)
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode >= 300 {
 		log.Fatalf("Status is %d", resp.StatusCode)
 	}
 
@@ -495,9 +605,18 @@ func doPost(label string, url string, m url.Values, auth string) (data ServerDat
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return ServerData{}, err
+		return nil, err
 	}
 
-	data = ServerData{Msg: label, JsonData: string(b)}
-	return data, nil
+	return &ServerData{Msg: label, Payload: string(b)}, nil
+}
+
+func prettyPrint(payload string, indent int) error {
+	var prettyJSON bytes.Buffer
+	err := json.Indent(&prettyJSON, []byte(payload), "", strings.Repeat(" ", indent))
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(prettyJSON.Bytes()))
+	return nil
 }
