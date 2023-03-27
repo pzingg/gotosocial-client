@@ -36,8 +36,6 @@ type OAuth struct {
 	State        string
 	Scope        string
 	RedirectUri  string
-	Code         string
-	AccessToken  string
 }
 
 type AppResp struct {
@@ -122,7 +120,8 @@ func main() {
 			return err
 		},
 	}
-	postCommand.Flags().StringVarP(&statusFile, "file", "f", "status.md", "Markdown file to post")
+	postCommand.Flags().StringVarP(&statusFile, "file", "f", "status.md",
+		"Markdown file to post")
 	rootCmd.AddCommand(postCommand)
 
 	var streamType string
@@ -133,7 +132,8 @@ func main() {
 			return stream(cmd.Context(), streamType)
 		},
 	}
-	streamCommand.Flags().StringVarP(&streamType, "type", "t", "public", "Stream type: user, public, direct, list, hashtag")
+	streamCommand.Flags().StringVarP(&streamType, "type", "t", "public",
+		"Stream type: user, public, direct, list, hashtag")
 	rootCmd.AddCommand(streamCommand)
 
 	// `signal.Notify` registers the given channel to
@@ -213,14 +213,13 @@ func registerApp(ctx context.Context, args []string) error {
 		m.Set("website", website)
 	}
 
-	appsUrl := instance + appsPath
-	d, err := httpPost("app", appsUrl, m, "")
+	jsonResp, err := httpPost("app", instance+appsPath, m, "")
 	if err != nil {
 		return err
 	}
 
 	var appResp AppResp
-	err = json.Unmarshal([]byte(d.Payload), &appResp)
+	err = json.Unmarshal([]byte(jsonResp.Payload), &appResp)
 
 	fmt.Println("Writing client secrets")
 	content := fmt.Sprintf("CLIENT_ID=\"%s\"\nCLIENT_SECRET=\"%s\"\nREDIRECT_URI=\"%s\"\nAPP_ID=\"%s\"\nAPP_NAME=\"%s\"\n",
@@ -267,7 +266,10 @@ func login(ctx context.Context, args []string) error {
 		RedirectUri:  oas.RedirectUri(),
 	}
 
-	authorize(oauth)
+	err = oauth.launchBrowser()
+	if err != nil {
+		return err
+	}
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -278,53 +280,49 @@ func login(ctx context.Context, args []string) error {
 			return nil
 		case <-oas.Ctx.Done():
 			return nil
-		case d := <-oas.Responses:
-			fmt.Printf("Got auth response: %v\n", d)
-			if d.Msg == "oauth-code" {
-				if d.Payload != "" {
-					var authResp oauthserver.AuthorizeResp
-					err := json.Unmarshal([]byte(d.Payload), &authResp)
-
-					if err != nil {
-						return err
-					}
-
-					if authResp.State != oauth.State {
-						return errors.New("State mismatch")
-					}
-
-					oauth.Code = authResp.Code
-
-					fmt.Println("Fetching token")
-					tokenData, err := getTokenResponse(oauth)
-					fmt.Printf("Got token response: %v\n", d)
-
-					if err != nil {
-						return err
-					}
-
-					var tokenResp TokenResp
-					err = json.Unmarshal([]byte(tokenData.Payload), &tokenResp)
-
-					if err != nil {
-						return err
-					}
-
-					oauth.AccessToken = tokenResp.AccessToken
-
-					fmt.Println("Writing access token")
-					line := oauth.AccessToken + "\n"
-					_ = os.WriteFile(tokenFile, []byte(line), 0644)
+		case jsonResp := <-oas.Responses:
+			if jsonResp.Type == "oauth-code" {
+				if jsonResp.Error != "" {
+					fmt.Printf("Error in oauth-code: %s\n", jsonResp.Error)
+					return errors.New(jsonResp.Error)
 				}
+
+				fmt.Println("Got auth response")
+				var authResp oauthserver.AuthorizeResp
+				err := json.Unmarshal([]byte(jsonResp.Payload), &authResp)
+				if err != nil {
+					return err
+				}
+				if authResp.State != oauth.State {
+					return errors.New("state mismatch")
+				}
+
+				fmt.Println("Fetching token")
+				jsonResp, err := oauth.getTokenResponse(authResp.Code)
+				if err != nil {
+					return err
+				}
+
+				fmt.Println("Got token response")
+				var tokenResp TokenResp
+				err = json.Unmarshal([]byte(jsonResp.Payload), &tokenResp)
+				if err != nil {
+					return err
+				}
+
+				fmt.Println("Writing access token")
+				line := tokenResp.AccessToken + "\n"
+				_ = os.WriteFile(tokenFile, []byte(line), 0644)
+				oas.Shutdown()
+				return nil
 			}
 		default:
 
 		}
 	}
-	return err
 }
 
-func authorize(oauth *OAuth) (err error) {
+func (oauth *OAuth) launchBrowser() error {
 	buf := make([]byte, 32)
 	rand.Read(buf)
 	oauth.State = fmt.Sprintf("%x", buf)
@@ -343,27 +341,25 @@ func authorize(oauth *OAuth) (err error) {
 	q.Set("redirect_uri", oauth.RedirectUri)
 	u.RawQuery = q.Encode()
 
-	err = exec.Command("xdg-open", u.String()).Run()
-	return err
+	return exec.Command("xdg-open", u.String()).Run()
 }
 
-func getTokenResponse(oauth *OAuth) (data *common.JsonResponse, err error) {
+func (oauth *OAuth) getTokenResponse(code string) (data *common.JsonResponse, err error) {
 	m := url.Values{}
 	m.Set("grant_type", "authorization_code")
+	m.Set("code", code)
 	m.Set("state", oauth.State)
-	m.Set("code", oauth.Code)
 	m.Set("client_id", oauth.ClientId)
 	m.Set("client_secret", oauth.ClientSecret)
 	m.Set("scope", oauth.Scope)
 	m.Set("redirect_uri", oauth.RedirectUri)
 
-	tokenUrl := oauth.Instance + tokenPath
-	return httpPost("oauth-token", tokenUrl, m, "")
+	return httpPost("oauth-token", oauth.Instance+tokenPath, m, "")
 }
 
 func postStatus(ctx context.Context, filename string) (data *common.JsonResponse, err error) {
 	if filename == "" {
-		return nil, errors.New("No filename")
+		return nil, errors.New("no filename")
 	}
 	instance, err := getInstance()
 	if err != nil {
@@ -389,16 +385,14 @@ func postStatus(ctx context.Context, filename string) (data *common.JsonResponse
 	m.Set("content_type", matter.ContentType)
 	m.Set("visibility", matter.Visiblity)
 
-	statusUrl := instance + statusPath
-	auth := "Bearer " + token
-	d, err := httpPost("status", statusUrl, m, auth)
+	jsonResp, err := httpPost("status", instance+statusPath, m, "Bearer "+token)
 	if err != nil {
-		return d, err
+		return jsonResp, err
 	}
 
 	fmt.Println("Post succeeded")
-	prettyPrint(d.Payload, 2)
-	return d, nil
+	prettyPrint(jsonResp.Payload, 2)
+	return jsonResp, nil
 }
 
 func stream(ctx context.Context, streamType string) error {
@@ -505,7 +499,7 @@ func getToken(filename string) (string, error) {
 }
 
 func httpGet(label string, url string) (data *common.JsonResponse, err error) {
-	r, err := http.NewRequest("GET", url, strings.NewReader(""))
+	r, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -531,20 +525,17 @@ func httpRequest(label string, r *http.Request) (data *common.JsonResponse, err 
 	if err != nil {
 		return nil, err
 	}
-
-	d := &common.JsonResponse{Type: label}
-	if resp.StatusCode >= 300 {
-		d.Error = fmt.Sprintf("Status %d", resp.StatusCode)
-	}
-
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	d.Payload = string(b)
-	return d, nil
+	jsonResp := &common.JsonResponse{Type: label, Payload: string(b)}
+	if resp.StatusCode >= 300 {
+		jsonResp.Error = fmt.Sprintf("status %d", resp.StatusCode)
+	}
+	return jsonResp, nil
 }
 
 func prettyPrint(payload string, indent int) error {

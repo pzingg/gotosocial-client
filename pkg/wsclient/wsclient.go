@@ -5,6 +5,7 @@ package wsclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -93,7 +94,7 @@ func (conn *WebSocketClient) Listen() {
 			for {
 				ws := conn.Connect()
 				if ws == nil {
-					err := fmt.Errorf("conn.ws is nil")
+					err := errors.New("conn.ws is nil")
 					conn.log("listen", err, "No websocket connection")
 					return
 				}
@@ -160,7 +161,9 @@ func (conn *WebSocketClient) Write(payload interface{}) error {
 		case conn.sendBuf <- data:
 			return nil
 		case <-ctx.Done():
-			return fmt.Errorf("Write: context canceled")
+			err := errors.New("context canceled")
+			conn.log("Write", err, "Done")
+			return err
 		}
 	}
 }
@@ -169,7 +172,7 @@ func (conn *WebSocketClient) listenWrite() {
 	for data := range conn.sendBuf {
 		ws := conn.Connect()
 		if ws == nil {
-			err := fmt.Errorf("conn.ws is nil")
+			err := errors.New("conn.ws is nil")
 			conn.log("listenWrite", err, "No websocket connection")
 			continue
 		}

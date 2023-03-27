@@ -7,18 +7,19 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 
-	"github.com/gorilla/mux"
 	"github.com/pzingg/gotosocial-client/pkg/common"
 )
 
 type OAuthServer struct {
+	Ctx       context.Context
+	CtxCancel context.CancelFunc
+	Origin    string
+	Responses chan common.JsonResponse
+
 	httpServer *http.Server
-	Ctx        context.Context
-	CtxCancel  context.CancelFunc
-	Origin     string
-	Responses  chan common.JsonResponse
 }
 
 type AuthorizeResp struct {
@@ -36,29 +37,35 @@ func NewOAuthServer(ctx context.Context, port int) *OAuthServer {
 	oas := &OAuthServer{Origin: origin, Responses: make(chan common.JsonResponse)}
 	oas.Ctx, oas.CtxCancel = context.WithCancel(ctx)
 
-	router := mux.NewRouter()
-	router.HandleFunc(RedirectPath, oas.callbackGETHandler)
-	oas.httpServer = &http.Server{Addr: addr, Handler: router}
+	mux := http.NewServeMux()
+	mux.HandleFunc(RedirectPath, oas.callbackGETHandler)
+	oas.httpServer = &http.Server{
+		Addr:    addr,
+		Handler: mux,
+		BaseContext: func(l net.Listener) context.Context {
+			return oas.Ctx
+		},
+	}
 
 	go oas.start()
 	return oas
 }
 
-func (oas *OAuthServer) RedirectUri() string {
-	return oas.Origin + RedirectPath
-}
-
 func (oas *OAuthServer) start() {
-	log.Println("Starting oauth server")
-	if err := oas.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	fmt.Println("Starting oauth server")
+	err := oas.httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		fmt.Println("Oauth server closed")
+	} else if err != nil {
+		fmt.Printf("Oauth server error listening: %s\n", err)
 	} else {
+		oas.Shutdown()
 		log.Println("Oauth server stopped gracefully")
 	}
 }
 
 func (oas *OAuthServer) Shutdown() {
-	log.Println("Shutting down oauth server")
+	fmt.Println("Shutting down oauth server")
 	oas.CtxCancel()
 }
 
@@ -71,8 +78,12 @@ func (oas *OAuthServer) callbackGETHandler(w http.ResponseWriter, r *http.Reques
 	text := fmt.Sprintf("Authorization code is %s\n\nYou can close this window.", code)
 	io.WriteString(w, text)
 
-	resp := AuthorizeResp{Code: code, State: state}
-	b, _ := json.Marshal(resp)
+	authResp := AuthorizeResp{Code: code, State: state}
+	b, _ := json.Marshal(authResp)
 
 	oas.Responses <- common.JsonResponse{Type: "oauth-code", Payload: string(b)}
+}
+
+func (oas *OAuthServer) RedirectUri() string {
+	return oas.Origin + RedirectPath
 }
