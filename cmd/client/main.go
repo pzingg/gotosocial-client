@@ -9,23 +9,23 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
+	"path/filepath"
 	godebug "runtime/debug"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/adrg/frontmatter"
-	"github.com/joho/godotenv"
 	"github.com/pzingg/gotosocial-client/pkg/common"
 	"github.com/pzingg/gotosocial-client/pkg/oauthserver"
 	"github.com/pzingg/gotosocial-client/pkg/wsclient"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 )
 
 type OAuth struct {
@@ -53,9 +53,21 @@ type TokenResp struct {
 	CreatedAt   int    `json:"created_at"`
 }
 
+type MediaResp struct {
+	Id   string `json:"id"`
+	Type string `json:"type"`
+	Url  string `json:"url"`
+}
+
+type MediaParams struct {
+	File        string `yaml:"file"`
+	Description string `yaml:"description"`
+}
+
 type PostFrontMatter struct {
 	ContentType string `yaml:"content_type"`
-	Visiblity   string `yaml:"visibility"`
+	Visibility  string `yaml:"visibility"`
+	Attachments []MediaParams
 }
 
 // Version is the version being used.
@@ -67,78 +79,111 @@ const authorizePath = "/oauth/authorize"
 const tokenPath = "/oauth/token"
 const appsPath = "/api/v1/apps"
 const statusPath = "/api/v1/statuses"
+const mediaPath = "/api/v1/media"
 const streamingPath = "/api/v1/streaming"
 
-// Where to write client secrets and access_token
+// Where to write client secrets and access token
 const secretsFile = "client_secrets.txt"
 const tokenFile = "access_token.txt"
 
-// Close connection correctly on exit
-var sigs = make(chan os.Signal, 1)
+// Global configuration
+var config *viper.Viper
 
 func main() {
-	version := version()
+	var instanceUrl string
+	var serverPort int
+	var scope string
+	var appName string
+	var website string
+	var clientId string
+	var clientSecret string
+	var statusFile string
+	var streamType string
 
-	err := godotenv.Load()
-	if err != nil {
-		fmt.Println(".env file not loaded")
-	}
+	version := version()
 
 	// instantiate the root command
 	rootCmd := &cobra.Command{
 		Use:           "client",
 		Short:         "GoToSocial Client - tools for logging in and posting to GoToSocial",
 		Version:       version,
-		SilenceErrors: false,
+		SilenceErrors: true,
 		SilenceUsage:  false,
 	}
 
-	registerCommand := &cobra.Command{
+	registerCmd := &cobra.Command{
 		Use:   "register",
 		Short: "Register a client app on gotosocial",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return loadConfig(cmd)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return registerApp(cmd.Context(), args)
 		},
 	}
-	rootCmd.AddCommand(registerCommand)
+	registerCmd.Flags().StringVarP(&instanceUrl, "instance_url", "i", "",
+		"GoToSocial instance URL")
+	registerCmd.Flags().IntVarP(&serverPort, "server_port", "p", 4040,
+		"Port on localhost to bind callback server")
+	registerCmd.Flags().StringVarP(&scope, "scope", "s", "read write follow push",
+		"Permissions")
+	registerCmd.Flags().StringVarP(&appName, "app_name", "n", "GtsClient",
+		"Name of app you are registering")
+	registerCmd.Flags().StringVarP(&website, "website", "w", "",
+		"Optional website name to register")
+	rootCmd.AddCommand(registerCmd)
 
-	loginCommand := &cobra.Command{
+	loginCmd := &cobra.Command{
 		Use:   "login",
 		Short: "Login to gotosocial using OAuth2 in a browser",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return loadConfig(cmd)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return login(cmd.Context(), args)
 		},
 	}
-	rootCmd.AddCommand(loginCommand)
+	loginCmd.Flags().StringVarP(&instanceUrl, "instance_url", "i", "",
+		"GoToSocial instance URL")
+	loginCmd.Flags().IntVarP(&serverPort, "server_port", "p", 4040,
+		"Port on localhost to bind callback server")
+	loginCmd.Flags().StringVarP(&scope, "scope", "s", "read write follow push",
+		"Permissions")
+	loginCmd.Flags().StringVarP(&clientId, "client_id", "", "",
+		"Client ID")
+	loginCmd.Flags().StringVarP(&clientSecret, "client_secret", "", "",
+		"Client secret")
+	rootCmd.AddCommand(loginCmd)
 
-	var statusFile string
-	postCommand := &cobra.Command{
+	postCmd := &cobra.Command{
 		Use:   "post",
 		Short: "Post a status to gotosocial",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return loadConfig(cmd)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := postStatus(cmd.Context(), statusFile)
-			return err
+			return postStatus(cmd.Context(), args)
 		},
 	}
-	postCommand.Flags().StringVarP(&statusFile, "file", "f", "status.md",
+	postCmd.Flags().StringVarP(&instanceUrl, "instance_url", "i", "",
+		"GoToSocial instance URL")
+	postCmd.Flags().StringVarP(&statusFile, "status_file", "f", "status.md",
 		"Markdown file to post")
-	rootCmd.AddCommand(postCommand)
+	rootCmd.AddCommand(postCmd)
 
-	var streamType string
-	streamCommand := &cobra.Command{
+	streamCmd := &cobra.Command{
 		Use:   "stream",
 		Short: "Listen for streaming from a gotosocial server",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return loadConfig(cmd)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return stream(cmd.Context(), streamType)
+			return stream(cmd.Context(), args)
 		},
 	}
-	streamCommand.Flags().StringVarP(&streamType, "type", "t", "public",
+	streamCmd.Flags().StringVarP(&streamType, "stream_type", "t", "user",
 		"Stream type: user, public, direct, list, hashtag")
-	rootCmd.AddCommand(streamCommand)
-
-	// `signal.Notify` registers the given channel to
-	// receive notifications of the specified signals.
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	rootCmd.AddCommand(streamCmd)
 
 	// run
 	if err := rootCmd.Execute(); err != nil {
@@ -189,20 +234,27 @@ func version() string {
 }
 
 func registerApp(ctx context.Context, args []string) error {
-	port, err := getPort()
-	if err != nil {
-		return err
+	if config == nil {
+		log.Panicln("no config")
 	}
-	instance, err := getInstance()
-	if err != nil {
-		return err
+	instance := config.GetString("instance_url")
+	if instance == "" {
+		return errors.New("missing instance_url")
 	}
-	scope, err := getScope()
-	if err != nil {
-		return err
+	port := config.GetInt("server_port")
+	if port == 0 {
+		return errors.New("missing server_port")
 	}
-	website, _ := os.LookupEnv("WEBSITE")
-
+	name := config.GetString("app_name")
+	if name == "" {
+		return errors.New("missing app_name")
+	}
+	scope := config.GetString("scope")
+	if scope == "" {
+		return errors.New("missing scope")
+	}
+	// website is optional
+	website := config.GetString("website")
 	redirectUri := fmt.Sprintf("http://localhost:%d%s", port, oauthserver.RedirectPath)
 
 	m := url.Values{}
@@ -217,11 +269,14 @@ func registerApp(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if jsonResp.Error != nil {
+		return jsonResp.Error
+	}
 
 	var appResp AppResp
 	err = json.Unmarshal([]byte(jsonResp.Payload), &appResp)
 
-	fmt.Println("Writing client secrets")
+	log.Println("Writing client secrets")
 	content := fmt.Sprintf("CLIENT_ID=\"%s\"\nCLIENT_SECRET=\"%s\"\nREDIRECT_URI=\"%s\"\nAPP_ID=\"%s\"\nAPP_NAME=\"%s\"\n",
 		appResp.ClientId,
 		appResp.ClientSecret,
@@ -234,26 +289,33 @@ func registerApp(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Copy your secrets from %s into .env file!\n", secretsFile)
+	log.Printf("Copy your secrets from %s into .env file!\n", secretsFile)
 	return nil
 }
 
-func login(ctx context.Context, args []string) error {
-	port, err := getPort()
-	if err != nil {
-		return err
+func login(ctx context.Context, args []string) (err error) {
+	if config == nil {
+		log.Panicln("no config")
 	}
-	instance, err := getInstance()
-	if err != nil {
-		return err
+	instance := config.GetString("instance_url")
+	if instance == "" {
+		return errors.New("missing instance_url")
 	}
-	scope, err := getScope()
-	if err != nil {
-		return err
+	port := config.GetInt("server_port")
+	if port == 0 {
+		return errors.New("missing server_port")
 	}
-	clientId, clientSecret, err := getSecrets()
-	if err != nil {
-		return err
+	scope := config.GetString("scope")
+	if scope == "" {
+		return errors.New("missing scope")
+	}
+	clientId := config.GetString("client_id")
+	if clientId == "" {
+		return errors.New("missing client_id")
+	}
+	clientSecret := config.GetString("client_secret")
+	if clientSecret == "" {
+		return errors.New("missing client_secret")
 	}
 
 	oas := oauthserver.NewOAuthServer(ctx, port)
@@ -273,23 +335,22 @@ func login(ctx context.Context, args []string) error {
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+
 	for ; ; <-ticker.C {
 		select {
-		case <-sigs:
-			oas.Shutdown()
-			return nil
 		case <-oas.Ctx.Done():
+			log.Println("Received server done. Goodbye")
 			return nil
 		case jsonResp := <-oas.Responses:
+			log.Printf("Received %s response\n", jsonResp.Type)
 			if jsonResp.Type == "oauth-code" {
-				if jsonResp.Error != "" {
-					fmt.Printf("Error in oauth-code: %s\n", jsonResp.Error)
-					return errors.New(jsonResp.Error)
+				if jsonResp.Error != nil {
+					log.Printf("Error in oauth-code: %s\n", jsonResp.Error)
+					return jsonResp.Error
 				}
 
-				fmt.Println("Got auth response")
 				var authResp oauthserver.AuthorizeResp
-				err := json.Unmarshal([]byte(jsonResp.Payload), &authResp)
+				err = json.Unmarshal([]byte(jsonResp.Payload), &authResp)
 				if err != nil {
 					return err
 				}
@@ -297,20 +358,23 @@ func login(ctx context.Context, args []string) error {
 					return errors.New("state mismatch")
 				}
 
-				fmt.Println("Fetching token")
+				log.Println("Fetching token")
 				jsonResp, err := oauth.getTokenResponse(authResp.Code)
 				if err != nil {
 					return err
 				}
+				if jsonResp.Error != nil {
+					return jsonResp.Error
+				}
 
-				fmt.Println("Got token response")
+				log.Println("Got token response")
 				var tokenResp TokenResp
 				err = json.Unmarshal([]byte(jsonResp.Payload), &tokenResp)
 				if err != nil {
 					return err
 				}
 
-				fmt.Println("Writing access token")
+				log.Println("Writing access token and stopping server")
 				line := tokenResp.AccessToken + "\n"
 				_ = os.WriteFile(tokenFile, []byte(line), 0644)
 				oas.Shutdown()
@@ -357,48 +421,137 @@ func (oauth *OAuth) getTokenResponse(code string) (data *common.JsonResponse, er
 	return httpPost("oauth-token", oauth.Instance+tokenPath, m, "")
 }
 
-func postStatus(ctx context.Context, filename string) (data *common.JsonResponse, err error) {
-	if filename == "" {
-		return nil, errors.New("no filename")
+func postStatus(ctx context.Context, args []string) (err error) {
+	if config == nil {
+		log.Panicln("no config")
 	}
-	instance, err := getInstance()
-	if err != nil {
-		return nil, err
+	instance := config.GetString("instance_url")
+	if instance == "" {
+		return errors.New("missing instance_url")
+	}
+	statusFile := config.GetString("status_file")
+	if statusFile == "" {
+		return errors.New("missing status_file")
 	}
 	token, err := getToken(tokenFile)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	file, err := os.Open(filename)
+	file, err := os.Open(statusFile)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	var matter PostFrontMatter
-	rest, err := frontmatter.Parse(file, &matter)
+	var meta PostFrontMatter
+	rest, err := frontmatter.Parse(file, &meta)
 	if err != nil {
-		return nil, err
+		return err
+	}
+
+	var mediaIds []string
+	if len(meta.Attachments) > 0 {
+		mediaIds, err = uploadMedia("attachments", meta.Attachments, instance+mediaPath, token)
+		if err != nil {
+			return err
+		}
 	}
 
 	m := url.Values{}
 	m.Set("status", string(rest))
-	m.Set("content_type", matter.ContentType)
-	m.Set("visibility", matter.Visiblity)
-
-	jsonResp, err := httpPost("status", instance+statusPath, m, "Bearer "+token)
-	if err != nil {
-		return jsonResp, err
+	m.Set("content_type", meta.ContentType)
+	m.Set("visibility", meta.Visibility)
+	for _, mediaId := range mediaIds {
+		m.Add("media_ids[]", mediaId)
 	}
 
-	fmt.Println("Post succeeded")
-	prettyPrint(jsonResp.Payload, 2)
-	return jsonResp, nil
-}
-
-func stream(ctx context.Context, streamType string) error {
-	instance, err := getInstance()
+	jsonResp, err := httpPost("post", instance+statusPath, m, "Bearer "+token)
 	if err != nil {
 		return err
+	}
+	if jsonResp.Error != nil {
+		return jsonResp.Error
+	}
+
+	log.Println("Post succeeded")
+	prettyPrint(jsonResp.Payload, 2)
+	return nil
+}
+
+func uploadMedia(label string, files []MediaParams, url string, token string) (mediaIds []string, err error) {
+	auth := "Bearer " + token
+	mediaIds = make([]string, len(files))
+
+	for index, params := range files {
+		jsonResp, err := uploadOne(label, params, url, auth)
+		if err != nil {
+			return nil, err
+		}
+		if jsonResp.Error != nil {
+			return nil, jsonResp.Error
+		}
+
+		var mediaResp MediaResp
+		err = json.Unmarshal([]byte(jsonResp.Payload), &mediaResp)
+		if err != nil {
+			return nil, err
+		}
+		mediaIds[index] = mediaResp.Id
+	}
+
+	return mediaIds, nil
+}
+
+func uploadOne(label string, params MediaParams, url string, auth string) (data *common.JsonResponse, err error) {
+	contents, err := os.ReadFile(params.File)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		buf = new(bytes.Buffer)
+		w   = multipart.NewWriter(buf)
+	)
+	err = w.WriteField("api_version", "v1")
+	if err != nil {
+		return nil, err
+	}
+	err = w.WriteField("description", params.Description)
+	if err != nil {
+		return nil, err
+	}
+	part, err := w.CreateFormFile("file", filepath.Base(params.File))
+	if err != nil {
+		return nil, err
+	}
+	_, err = part.Write(contents)
+	if err != nil {
+		return nil, err
+	}
+	err = w.Close()
+	if err != nil {
+		return nil, err
+	}
+	r, err := http.NewRequest("POST", url, buf)
+	if err != nil {
+		return nil, err
+	}
+	r.Header.Add("Content-Type", w.FormDataContentType())
+	if auth != "" {
+		r.Header.Add("Authorization", auth)
+	}
+	return httpRequest(label, r)
+}
+
+func stream(ctx context.Context, args []string) error {
+	if config == nil {
+		log.Panicln("no config")
+	}
+	instance := config.GetString("instance_url")
+	if instance == "" {
+		return errors.New("missing instance_url")
+	}
+	streamType := config.GetString("stream_type")
+	if streamType == "" {
+		return errors.New("missing stream_type")
 	}
 	token, err := getToken(tokenFile)
 	if err != nil {
@@ -411,8 +564,13 @@ func stream(ctx context.Context, streamType string) error {
 		return err
 	}
 
-	/* u.Scheme = "wss" */
-	u.Scheme = "ws"
+	// GoToSocial stream connection requires ws or wss connection URL
+	if u.Scheme == "http" {
+		u.Scheme = "ws"
+	} else {
+		u.Scheme = "wss"
+	}
+	// Required query string
 	q := url.Values{}
 	q.Set("access_token", token)
 	q.Set("stream", streamType)
@@ -421,72 +579,66 @@ func stream(ctx context.Context, streamType string) error {
 	messages := make(chan wsclient.GtsMessage, 1)
 	wsClient := wsclient.NewWebSocketClient(ctx, u.String(), messages)
 
+	// Send subscribe message to open stream
 	m := make(map[string]string)
 	m["type"] = "subscribe"
 	m["stream"] = streamType
 	err = wsClient.Write(m)
 	if err != nil {
-		fmt.Println("Write failed, stopping")
+		log.Println("Stream write failed, stopping")
 		wsClient.Stop()
 		return err
 	}
 
-	fmt.Println("Waiting for messages on stream")
+	log.Println("Waiting for messages on stream")
 	var message wsclient.GtsMessage
 	for {
 		select {
-		case message = <-messages:
-			fmt.Printf("Received message for %v: %s\n", message.Stream, message.Event)
-			prettyPrint(message.Payload, 2)
-		case <-sigs:
-			fmt.Println("Received signal. Stopping")
-			wsClient.Stop()
-			return nil
 		case <-wsClient.Ctx.Done():
-			fmt.Println("Received socket done. Goodbye")
+			log.Println("Received socket done. Goodbye")
 			return nil
+		case message = <-messages:
+			log.Printf("Received message for %v: %s\n", message.Stream, message.Event)
+			prettyPrint(message.Payload, 2)
 		default:
-
+			// spin spin spin
 		}
-		// spin spin spin
 	}
 }
 
-func getInstance() (instance string, err error) {
-	instance, ok := os.LookupEnv("INSTANCE_URL")
-	if !ok {
-		return "", errors.New("missing INSTANCE_URL")
+func loadConfig(cmd *cobra.Command) error {
+	v := viper.New()
+	v.AddConfigPath(".")
+	v.SetConfigName("local")
+	v.SetConfigType("env")
+	v.AutomaticEnv()
+
+	err := v.ReadInConfig()
+	if err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			return err
+		}
+
+		// It's okay if there isn't a config file
+		log.Println("No local.env config file read")
 	}
-	return instance, nil
+
+	// Merge cmd flags on top of environment settings, and set global config
+	config = bindFlags(cmd, v)
+
+	return nil
 }
 
-func getPort() (port int, err error) {
-	serverPort, ok := os.LookupEnv("SERVER_PORT")
-	if !ok {
-		return 0, errors.New("missing SERVER_PORT")
-	}
-	port, err = strconv.Atoi(serverPort)
-	return port, err
-}
-
-func getScope() (scope string, err error) {
-	scope, ok := os.LookupEnv("SCOPE")
-	if !ok {
-		return "", errors.New("missing SCOPE")
-	}
-	return scope, nil
-}
-
-func getSecrets() (clientId string, clientSecret string, err error) {
-	clientId, ok := os.LookupEnv("CLIENT_ID")
-	if !ok {
-		return "", "", errors.New("missing CLIENT_ID")
-	}
-	clientSecret, ok = os.LookupEnv("CLIENT_SECRET")
-	if !ok {
-		return "", "", errors.New("missing CLIENT_SECRET")
-	}
-	return clientId, clientSecret, nil
+// Bind each cobra flag to its associated viper configuration
+// (config file and environment variable)
+func bindFlags(cmd *cobra.Command, v *viper.Viper) *viper.Viper {
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		key := f.Name
+		if key != "help" && (f.Changed || !v.IsSet(key)) {
+			v.BindPFlag(key, f)
+		}
+	})
+	return v
 }
 
 func getToken(filename string) (string, error) {
@@ -533,7 +685,7 @@ func httpRequest(label string, r *http.Request) (data *common.JsonResponse, err 
 
 	jsonResp := &common.JsonResponse{Type: label, Payload: string(b)}
 	if resp.StatusCode >= 300 {
-		jsonResp.Error = fmt.Sprintf("status %d", resp.StatusCode)
+		jsonResp.Error = &common.HttpResponseError{Type: label, StatusCode: resp.StatusCode}
 	}
 	return jsonResp, nil
 }
@@ -544,6 +696,6 @@ func prettyPrint(payload string, indent int) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(string(prettyJSON.Bytes()))
+	log.Println(string(prettyJSON.Bytes()))
 	return nil
 }

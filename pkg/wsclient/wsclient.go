@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -45,10 +48,9 @@ func NewWebSocketClient(ctx context.Context, wsUrl string, msgChan chan GtsMessa
 		sendBuf:   make(chan []byte, 1),
 		Messages:  msgChan,
 	}
-	conn.Ctx, conn.CtxCancel = context.WithCancel(ctx)
-	defer conn.CtxCancel()
+	conn.Ctx, conn.CtxCancel = signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Printf("Connecting to %s\n", wsUrl)
+	log.Printf("Connecting to %s\n", wsUrl)
 
 	go conn.Listen()
 	go conn.listenWrite()
@@ -65,6 +67,7 @@ func (conn *WebSocketClient) Connect() *websocket.Conn {
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+
 	for ; ; <-ticker.C {
 		select {
 		case <-conn.Ctx.Done():
@@ -82,10 +85,12 @@ func (conn *WebSocketClient) Connect() *websocket.Conn {
 	}
 }
 
+// Receive control, binary, text, and JSON-encoded messages from the peer
 func (conn *WebSocketClient) Listen() {
-	conn.log("listen", nil, fmt.Sprintf("listen for the messages: %s", conn.configStr))
+	conn.log("listen", nil, fmt.Sprintf("Listen for the messages: %s", conn.configStr))
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-conn.Ctx.Done():
@@ -111,41 +116,47 @@ func (conn *WebSocketClient) Listen() {
 					}
 				}
 				switch msgType {
-				// TextMessage denotes a text data message. The text message payload is
-				// interpreted as UTF-8 encoded text data.
 				case websocket.TextMessage:
+					// TextMessage denotes a text data message. The text message payload is
+					// interpreted as UTF-8 encoded text data.
 					var message GtsMessage
 					err = json.Unmarshal(msgBytes, &message)
 					if err != nil {
-						conn.log("listen", err, fmt.Sprintf("websocket TextMessage: %d bytes", len(msgBytes)))
+						conn.log("listen", err, fmt.Sprintf("TextMessage: %d bytes", len(msgBytes)))
 					} else {
-						conn.log("listen", err, fmt.Sprintf("websocket GtsMessage: %s", message.Event))
+						conn.log("listen", err, fmt.Sprintf("GtsMessage: %s", message.Event))
 					}
+					// Send decoded message to whoever is listening
 					conn.Messages <- message
-				// BinaryMessage denotes a binary data message.
-				case websocket.BinaryMessage:
-					conn.log("listen", nil, fmt.Sprintf("websocket BinaryMessage: %d bytes", len(msgBytes)))
-				// CloseMessage denotes a close control message. The optional message
-				// payload contains a big-endian uint16 numeric close code and text.
-				case websocket.CloseMessage:
-					conn.log("listen", nil, fmt.Sprintf("websocket CloseMessage: %d bytes", len(msgBytes)))
-				// PingMessage denotes a ping control message. The optional message payload
-				// is UTF-8 encoded text.
+
 				case websocket.PingMessage:
-					conn.log("listen", nil, fmt.Sprintf("websocket PingMessage: '%s'", string(msgBytes)))
-				// PongMessage denotes a pong control message. The optional message payload
-				// is UTF-8 encoded text.
+					// PingMessage denotes a ping control message. The optional message payload
+					// is UTF-8 encoded text.
+					conn.log("listen", nil, fmt.Sprintf("PingMessage: '%s'", string(msgBytes)))
+
 				case websocket.PongMessage:
-					conn.log("listen", nil, fmt.Sprintf("websocket PongMessage: '%s'", string(msgBytes)))
+					// PongMessage denotes a pong control message. The optional message payload
+					// is UTF-8 encoded text.
+					conn.log("listen", nil, fmt.Sprintf("PongMessage: '%s'", string(msgBytes)))
+
+				case websocket.BinaryMessage:
+					// BinaryMessage denotes a binary data message.
+					conn.log("listen", nil, fmt.Sprintf("BinaryMessage: %d bytes", len(msgBytes)))
+
+				case websocket.CloseMessage:
+					// CloseMessage denotes a close control message. The optional message
+					// payload contains a big-endian uint16 numeric close code and text.
+					conn.log("listen", nil, fmt.Sprintf("CloseMessage: %d bytes", len(msgBytes)))
+
 				default:
-					conn.log("listen", nil, fmt.Sprintf("websocket unknown type %d: %d bytes", msgType, len(msgBytes)))
+					conn.log("listen", nil, fmt.Sprintf("Websocket unknown type %d: %d bytes", msgType, len(msgBytes)))
 				}
 			}
 		}
 	}
 }
 
-// Write data to the websocket server
+// JSON encode an object and send encoded string to the peer
 func (conn *WebSocketClient) Write(payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -168,6 +179,7 @@ func (conn *WebSocketClient) Write(payload interface{}) error {
 	}
 }
 
+// Read all bytes in sendBuf and send to the peer
 func (conn *WebSocketClient) listenWrite() {
 	for data := range conn.sendBuf {
 		ws := conn.Connect()
@@ -185,13 +197,13 @@ func (conn *WebSocketClient) listenWrite() {
 	}
 }
 
-// Close will send close message and shutdown websocket connection
+// Signal Ctx.Done(), send close message and close connection
 func (conn *WebSocketClient) Stop() {
 	conn.CtxCancel()
 	conn.closeWs()
 }
 
-// Close will send close message and shutdown websocket connection
+// Send close message and close connection
 func (conn *WebSocketClient) closeWs() {
 	conn.mu.Lock()
 	if conn.wsconn != nil {
@@ -207,6 +219,7 @@ func (conn *WebSocketClient) ping() {
 	conn.log("ping", nil, "ping pong started")
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
@@ -226,12 +239,10 @@ func (conn *WebSocketClient) ping() {
 	}
 }
 
-// Log print log statement
-// In real word I would recommend to use zerolog or any other solution
 func (conn *WebSocketClient) log(f string, err error, msg string) {
 	if err != nil {
-		fmt.Printf("[ERROR] %s, err: %v, msg: %s\n", f, err, msg)
+		log.Printf("[ERROR] %s, err: %v, msg: %s\n", f, err, msg)
 	} else {
-		fmt.Printf("[INFO] %s, %s\n", f, msg)
+		log.Printf("[INFO] %s, %s\n", f, msg)
 	}
 }

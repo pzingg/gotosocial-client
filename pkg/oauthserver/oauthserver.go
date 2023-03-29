@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os/signal"
+	"syscall"
 
 	"github.com/pzingg/gotosocial-client/pkg/common"
 )
@@ -35,7 +37,7 @@ func NewOAuthServer(ctx context.Context, port int) *OAuthServer {
 	origin := fmt.Sprintf("http://localhost:%d", port)
 
 	oas := &OAuthServer{Origin: origin, Responses: make(chan common.JsonResponse)}
-	oas.Ctx, oas.CtxCancel = context.WithCancel(ctx)
+	oas.Ctx, oas.CtxCancel = signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(RedirectPath, oas.callbackGETHandler)
@@ -52,12 +54,14 @@ func NewOAuthServer(ctx context.Context, port int) *OAuthServer {
 }
 
 func (oas *OAuthServer) start() {
-	fmt.Println("Starting oauth server")
+	log.Println("Starting oauth server")
+	defer oas.CtxCancel()
+
 	err := oas.httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
-		fmt.Println("Oauth server closed")
+		log.Println("Oauth server closed")
 	} else if err != nil {
-		fmt.Printf("Oauth server error listening: %s\n", err)
+		log.Printf("Oauth server error listening: %s\n", err)
 	} else {
 		oas.Shutdown()
 		log.Println("Oauth server stopped gracefully")
@@ -65,12 +69,12 @@ func (oas *OAuthServer) start() {
 }
 
 func (oas *OAuthServer) Shutdown() {
-	fmt.Println("Shutting down oauth server")
+	log.Println("Shutting down oauth server")
 	oas.CtxCancel()
 }
 
 func (oas *OAuthServer) callbackGETHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Got callback request")
+	log.Println("Got callback request")
 
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
@@ -79,9 +83,9 @@ func (oas *OAuthServer) callbackGETHandler(w http.ResponseWriter, r *http.Reques
 	io.WriteString(w, text)
 
 	authResp := AuthorizeResp{Code: code, State: state}
-	b, _ := json.Marshal(authResp)
+	b, err := json.Marshal(authResp)
 
-	oas.Responses <- common.JsonResponse{Type: "oauth-code", Payload: string(b)}
+	oas.Responses <- common.JsonResponse{Type: "oauth-code", Payload: string(b), Error: err}
 }
 
 func (oas *OAuthServer) RedirectUri() string {
